@@ -1,0 +1,173 @@
+#!/usr/bin/env bash
+# devc — run any project in a podman dev container.
+#
+# Spins up (and reuses) a persistent container for the current directory,
+# bind-mounted at /workspace, with Python 3.12, Node 22 and the Claude Code CLI.
+# Anything else you need: `sudo apt-get install ...` or `pip install ...` inside —
+# the container persists, so installs survive until you `devc rm`.
+#
+# Usage:
+#   devc                 start/attach a shell in the container for $PWD
+#   devc code            open VS Code attached inside the container at /workspace
+#   devc claude [args]   run the Claude Code CLI inside the container
+#   devc run <cmd...>    run an arbitrary command inside the container
+#   devc build           (re)build the base image
+#   devc stop            stop this project's container
+#   devc rm              stop + remove this project's container
+#   devc ls              list all devc containers
+set -euo pipefail
+
+IMAGE="devc-base:latest"
+
+# Resolve the real login home from the passwd db, not $HOME: editors that run
+# under snap/flatpak confinement (e.g. VS Code) rewrite $HOME and XDG_* to point
+# inside their sandbox, where the real ~/.claude config does not live. Fall back
+# to $HOME where getent is unavailable (macOS, Git Bash on Windows).
+if command -v getent >/dev/null 2>&1; then
+    REAL_HOME="$(getent passwd "$(id -u)" | cut -d: -f6)"
+fi
+[ -n "${REAL_HOME:-}" ] || REAL_HOME="$HOME"
+
+err() { printf 'devc: %s\n' "$*" >&2; }
+
+# Base image definition. Single source of truth; built from stdin (no context
+# dir needed since there is no COPY). Edit here, then run `devc build`.
+dockerfile() {
+cat <<'EOF'
+FROM python:3.12-bookworm
+
+# --- system tooling (extend at runtime with: sudo apt-get install ...) ---
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        curl git ca-certificates sudo less vim nano \
+        build-essential pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+# --- Node.js (also required by the Claude Code CLI) ---
+RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
+    && rm -rf /var/lib/apt/lists/*
+
+# --- Claude Code CLI ---
+RUN npm install -g @anthropic-ai/claude-code
+
+# --- non-root user with passwordless sudo + serial access (dialout) ---
+ARG USERNAME=dev
+ARG USER_UID=1000
+ARG USER_GID=1000
+RUN groupadd --gid $USER_GID $USERNAME \
+    && useradd --uid $USER_UID --gid $USER_GID -m -s /bin/bash $USERNAME \
+    && usermod -aG dialout $USERNAME \
+    && echo "$USERNAME ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/$USERNAME \
+    && chmod 0440 /etc/sudoers.d/$USERNAME
+
+USER $USERNAME
+WORKDIR /workspace
+CMD ["/bin/bash"]
+EOF
+}
+
+build_image() {
+    err "building $IMAGE ..."
+    dockerfile | podman build -t "$IMAGE" -f - .
+}
+
+ensure_image() {
+    podman image exists "$IMAGE" || build_image
+}
+
+# Stable container name derived from the project path. md5sum on Linux, `md5`
+# on macOS, cksum as a last resort — just needs to be stable per path.
+project_dir="$(pwd)"
+base="$(basename "$project_dir" | tr -c 'a-zA-Z0-9_.-' '-')"
+if command -v md5sum >/dev/null 2>&1; then
+    hash="$(printf '%s' "$project_dir" | md5sum | cut -c1-8)"
+elif command -v md5 >/dev/null 2>&1; then
+    hash="$(printf '%s' "$project_dir" | md5 -q | cut -c1-8)"
+else
+    hash="$(printf '%s' "$project_dir" | cksum | tr -d ' ' | cut -c1-8)"
+fi
+CONTAINER="devc-${base}-${hash}"
+
+# Create the container if it doesn't exist yet, then make sure it's running.
+ensure_container() {
+    ensure_image
+    if ! podman container exists "$CONTAINER"; then
+        err "creating container $CONTAINER for $project_dir"
+        local mounts=()
+        # Persist Claude Code auth/config across containers if present on host.
+        [ -d "$REAL_HOME/.claude" ]      && mounts+=(-v "$REAL_HOME/.claude:/home/dev/.claude:Z")
+        [ -f "$REAL_HOME/.claude.json" ] && mounts+=(-v "$REAL_HOME/.claude.json:/home/dev/.claude.json:Z")
+        [ -f "$REAL_HOME/.gitconfig" ]   && mounts+=(-v "$REAL_HOME/.gitconfig:/home/dev/.gitconfig:ro,Z")
+        # Host networking only on native Linux (any port the app binds is
+        # reachable from the host). On podman-machine (macOS/Windows) the host is
+        # a VM, so publish ports with DEVC_ARGS="-p 5000:5000" or let VS Code's
+        # attach auto-forward them instead.
+        local net=()
+        [ "$(uname -s)" = "Linux" ] && net=(--network host)
+        # Extra podman flags applied at create time, e.g. to expose a device or
+        # publish a port:  DEVC_ARGS="--device=/dev/ttyACM0" devc
+        # shellcheck disable=SC2206
+        local extra=(${DEVC_ARGS:-})
+        podman create \
+            --name "$CONTAINER" \
+            --hostname "$base" \
+            --userns=keep-id \
+            "${net[@]}" \
+            -v "$project_dir:/workspace:Z" \
+            -w /workspace \
+            -e PYTHONUNBUFFERED=1 \
+            "${mounts[@]}" \
+            "${extra[@]}" \
+            -it "$IMAGE" >/dev/null
+    fi
+    if [ "$(podman inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null)" != "true" ]; then
+        podman start "$CONTAINER" >/dev/null
+    fi
+}
+
+cmd="${1:-shell}"
+case "$cmd" in
+    build|rebuild)
+        build_image
+        ;;
+    ls|list)
+        podman ps -a --filter "name=^devc-" \
+            --format 'table {{.Names}}\t{{.Status}}\t{{.Image}}'
+        ;;
+    stop)
+        podman stop "$CONTAINER" >/dev/null && err "stopped $CONTAINER" || err "not running"
+        ;;
+    rm|remove)
+        podman rm -f "$CONTAINER" >/dev/null && err "removed $CONTAINER" || err "no such container"
+        ;;
+    code|vscode)
+        ensure_container
+        # Open VS Code attached inside the running container. The Dev Containers
+        # extension addresses it via remote authority attached-container+<hexname>.
+        hex="$(printf '%s' "$CONTAINER" | od -An -tx1 | tr -d ' \n')"
+        exec code --folder-uri "vscode-remote://attached-container+${hex}/workspace"
+        ;;
+    claude)
+        shift
+        ensure_container
+        exec podman exec -it "$CONTAINER" claude "$@"
+        ;;
+    run|exec)
+        shift
+        [ "$#" -gt 0 ] || { err "run: need a command"; exit 1; }
+        ensure_container
+        exec podman exec -it "$CONTAINER" "$@"
+        ;;
+    shell|sh|bash)
+        ensure_container
+        exec podman exec -it "$CONTAINER" bash
+        ;;
+    -h|--help|help)
+        sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'
+        ;;
+    *)
+        err "unknown command: $cmd (try: devc help)"
+        exit 1
+        ;;
+esac
