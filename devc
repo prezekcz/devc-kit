@@ -109,10 +109,17 @@ ensure_container() {
         # publish a port:  DEVC_ARGS="--device=/dev/ttyACM0" devc
         # shellcheck disable=SC2206
         local extra=(${DEVC_ARGS:-})
+        # Map the host user onto the image's `dev` user (uid 1000) so bind-mounted
+        # files (the project at /workspace and the ~/.claude etc. below) are owned
+        # by dev inside and stay owned by you on the host. Plain `keep-id` would
+        # map your host uid to the SAME uid inside, which only lines up if your
+        # host uid is 1000 — on servers where it isn't (e.g. 1001), dev (1000)
+        # can't read your mounted ~/.claude (mode 700) or write /workspace.
+        # keep-id:uid=1000 collapses to plain keep-id when your host uid is 1000.
         podman create \
             --name "$CONTAINER" \
             --hostname "$base" \
-            --userns=keep-id \
+            --userns=keep-id:uid=1000,gid=1000 \
             "${net[@]}" \
             -v "$project_dir:/workspace:Z" \
             -w /workspace \
