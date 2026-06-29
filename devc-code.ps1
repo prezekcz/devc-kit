@@ -129,7 +129,25 @@ if ($names -notcontains $Container) {
 }
 Write-Host "ok: '$Container' reachable through the tunnel"
 
-# --- 3) isolated VS Code profile: seed once from your main profile + dockerPath -
+# --- 3) clear any hung VS Code server in the container (fixes "never connects") -
+# A stale/orphaned vscode-server `node` process (e.g. left by a dropped session)
+# makes a fresh attach hang forever. Restarting the whole container clears it, but
+# that also kills everything else running inside. Instead, kill just the server
+# processes (+ their lock files) so VS Code respawns one cleanly on attach; your
+# running work in the container survives. No-op on a healthy first connect.
+# NOTE: if you have a working window already attached to this container, this will
+# drop that session - rerun the script to reconnect.
+$cleanup = @'
+pkill -TERM -f '/.vscode-server/' 2>/dev/null || true
+sleep 1
+pkill -KILL -f '/.vscode-server/' 2>/dev/null || true
+find "$HOME/.vscode-server" -maxdepth 4 -name '*.lock' -delete 2>/dev/null || true
+exit 0
+'@
+Write-Host "clearing any stale VS Code server in '$Container'"
+& podman --url $url exec $Container /bin/sh -c $cleanup 2>$null
+
+# --- 4) isolated VS Code profile: seed once from your main profile + dockerPath -
 $profUser = Join-Path $ProfileDir "User"
 New-Item -ItemType Directory -Force -Path $profUser | Out-Null
 $settings = Join-Path $profUser "settings.json"
@@ -150,7 +168,7 @@ if ($txt -notmatch 'dev\.containers\.dockerPath') {
     Set-Content $settings $txt -NoNewline
 }
 
-# --- 4) point podman at the tunnel for THIS process only, then launch VS Code --
+# --- 5) point podman at the tunnel for THIS process only, then launch VS Code --
 $env:CONTAINER_HOST = $url
 $env:DOCKER_HOST    = $url
 $hex = (([System.Text.Encoding]::ASCII.GetBytes($Container) | ForEach-Object { $_.ToString("x2") }) -join "")
