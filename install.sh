@@ -12,6 +12,8 @@ command -v podman >/dev/null 2>&1 || {
 mkdir -p "$dest"
 install -m 0755 "$src_dir/devc" "$dest/devc"
 echo "Installed devc -> $dest/devc"
+install -m 0755 "$src_dir/devc-code.sh" "$dest/devc-code.sh"
+echo "Installed devc-code.sh -> $dest/devc-code.sh"
 
 case ":$PATH:" in
     *":$dest:"*) ;;

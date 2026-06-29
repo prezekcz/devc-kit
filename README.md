@@ -16,6 +16,7 @@ project bind-mounted at `/workspace`.
 |---------------|-------------------------------------------|
 | `devc`          | Launcher for **Linux / macOS** (bash)                          |
 | `devc.ps1`      | Launcher for **Windows** (PowerShell)                          |
+| `devc-code.sh`  | Attach Linux / macOS VS Code to a container on a **remote server** |
 | `devc-code.ps1` | Attach Windows VS Code to a container on a **remote server**   |
 | `install.sh`    | Installer for Linux / macOS                                    |
 | `install.ps1`   | Installer for Windows                                          |
@@ -73,21 +74,23 @@ cd ~/my-project
 devc code            # creates+starts the container, opens VS Code inside it
 ```
 
-## Remote server: VS Code from Windows (`devc-code.ps1`)
+## Remote server: VS Code from your desktop (`devc-code.sh` / `devc-code.ps1`)
 
-Run the container on a Linux **server** and attach your **local** VS Code to it
-from Windows. This needs its own tool because:
+Run the container on a Linux **server** and attach your **local** VS Code to it,
+from a Linux/macOS desktop (`devc-code.sh`) or Windows (`devc-code.ps1`). This
+needs its own tool because:
 
-- `devc code` on the server has no GUI to open, and VS Code has no CLI to attach
-  to a container nested inside a Remote-SSH session.
-- podman's own ssh client on Windows is broken for this (drops the host:
+- `devc code` *on the server* has no GUI to open, and VS Code has no CLI to attach
+  to a container nested inside a Remote-SSH session — so attaching has to be
+  driven from the desktop, against the server's podman.
+- (Windows only) podman's own ssh client is broken for this (drops the host:
   `dial tcp :22 ... refused`).
 
-`devc-code.ps1` works around all of it: it tunnels the server's rootless podman
-socket to a local TCP port over **OpenSSH**, points podman at that tunnel for a
-single process only, and opens an **isolated** VS Code instance attached to the
-container. Your local podman default connection and your main VS Code are left
-untouched.
+Both scripts work around it the same way: they tunnel the server's rootless
+podman socket to a local TCP port over **OpenSSH**, point podman at that tunnel
+for a single process only, and open an **isolated** VS Code instance attached to
+the container. Your local podman default connection and your main VS Code are
+left untouched.
 
 **On the server (once):**
 ```bash
@@ -96,10 +99,33 @@ systemctl --user enable --now podman.socket    # expose the rootless podman API
 loginctl enable-linger "$USER"                 # keep it up after you log out
 ```
 
-**On Windows you need:** OpenSSH with key access (`ssh user@server` works
-passwordless), the podman client, and VS Code + the Dev Containers extension.
-(The script sets `dev.containers.dockerPath: podman` in its own VS Code profile,
-so you don't have to.)
+### From Linux / macOS (`devc-code.sh`)
+
+**You need:** OpenSSH with key access (`ssh user@server` works passwordless), the
+`podman` client, and VS Code + the Dev Containers extension. The script sets
+`dev.containers.dockerPath: podman` in its own VS Code profile, so you don't
+have to.
+
+```bash
+# first run: pass the server once — it's saved to ~/.devc-code.json
+./devc-code.sh --server user@server
+
+# later: just run it, then pick the container from the list found on the server
+devc-code.sh
+
+devc-code.sh --container devc-myproj-1a2b3c4d   # skip the picker
+devc-code.sh --stop                             # close the ssh tunnel
+```
+
+Options: `--identity <keyfile>` (default `~/.ssh/id_ed25519`), `--local-port`,
+`--workspace`. Using VSCodium/Insiders? `DEVC_CODE_BIN=codium devc-code.sh`.
+
+### From Windows (`devc-code.ps1`)
+
+**You need:** OpenSSH with key access (`ssh user@server` works passwordless), the
+podman client, and VS Code + the Dev Containers extension. (The script sets
+`dev.containers.dockerPath: podman` in its own VS Code profile, so you don't
+have to.)
 
 ```powershell
 # first run: pass the server once — it's saved to %USERPROFILE%\.devc-code.json
@@ -112,7 +138,7 @@ so you don't have to.)
 .\devc-code.ps1 -Stop                             # close the ssh tunnel
 ```
 
-Nothing is hard-coded: `-Server` / `-Identity` / `-LocalPort` come from the
+Nothing is hard-coded in either: server / identity / local-port come from the
 config file, the remote uid (socket path) is discovered over ssh, and the
 container is chosen from the running `devc-*` containers on the server.
 
@@ -154,19 +180,26 @@ If present on the host, these are mounted so auth/config "just works":
 
 - **`devc code` does nothing / wrong folder** — make sure the Dev Containers
   extension is installed and `dev.containers.dockerPath` is `podman`.
-- **`--userns=keep-id` error on Windows/macOS** — remove it from the create args
-  in the script (it's mainly for correct file ownership on rootless Linux).
-- **Files written in the container owned by the wrong user (Linux)** —
-  `--userns=keep-id` handles this; ensure your podman is rootless.
-- **No write access to `/workspace` on a server (uid mismatch)** — `keep-id`
-  maps your host user to the *same* uid inside the container, but the `dev` user
-  is uid 1000. If your server login uid isn't 1000, the bind-mounted files end
-  up unwritable. Map your host user onto `dev` instead: change
-  `--userns=keep-id` to `--userns=keep-id:uid=1000,gid=1000` in the `devc`
-  create args, then `devc rm` and relaunch.
-- **VS Code on Windows can't see a container running on a server** — don't run
-  `devc code` on the server; use [`devc-code.ps1`](#remote-server-vs-code-from-windows-devc-codeps1)
-  from Windows. Plain `devc code` / a podman ssh connection won't work (see that
-  section).
+- **`--userns` error on Windows/macOS** — remove `--userns=keep-id:uid=1000,gid=1000`
+  from the create args in the script (it's mainly for correct file ownership on
+  rootless Linux).
+- **Files / `~/.claude` / `/workspace` owned by the wrong user (Linux)** — the
+  `devc` script maps your host user onto the image's `dev` user (uid 1000) via
+  `--userns=keep-id:uid=1000,gid=1000`, so bind-mounts line up no matter what
+  your host uid is. If you have an **older** container created before this (plain
+  `--userns=keep-id`) and your host uid isn't 1000, `dev` can't read your mounted
+  `~/.claude` (mode 700) or write `/workspace` — recreate it with `devc rm` then
+  `devc` (or `devc code`). Ensure your podman is rootless.
+- **Your desktop VS Code can't see a container running on a server** — don't run
+  `devc code` on the server; drive the attach from your desktop with
+  [`devc-code.sh`](#from-linux--macos-devc-codesh) (Linux/macOS) or
+  [`devc-code.ps1`](#from-windows-devc-codeps1) (Windows). Plain `devc code` / a
+  podman ssh connection won't work (see that section).
+- **`ERRO ... graph driver "overlay" overwritten by ... "vfs"`** — harmless for
+  this workflow. It's the *server's* local podman client warning that its store
+  was first initialised with `vfs`; the remote API (the socket the tunnel uses)
+  and your containers still work. To silence it, pin the driver by adding
+  `[storage]`/`driver = "vfs"` to `~/.config/containers/storage.conf` on the
+  server, or migrate to overlay with a `podman system reset` (wipes containers).
 - **VS Code under snap/flatpak (Linux)** — these rewrite `$HOME`; the bash script
   already resolves the real home via `getent`, so `~/.claude` mounts correctly.
