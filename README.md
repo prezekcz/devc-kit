@@ -107,18 +107,25 @@ loginctl enable-linger "$USER"                 # keep it up after you log out
 have to.
 
 ```bash
-# first run: pass the server once — it's saved to ~/.devc-code.json
+# open/reuse a tunnel to a server (identity is saved to ~/.devc-code.json)
 ./devc-code.sh --server user@server
 
-# later: just run it, then pick the container from the list found on the server
+# later: just run it, then pick the container from ALL connected servers
 devc-code.sh
 
+# connect a second server too — both stay up, the picker lists containers from both
+devc-code.sh --server user@other-server
+
 devc-code.sh --container devc-myproj-1a2b3c4d   # skip the picker
-devc-code.sh --stop                             # close the ssh tunnel
+devc-code.sh --stop                             # stop ALL devc tunnels
+devc-code.sh --server user@server --stop        # stop just that server's tunnel
 ```
 
-Options: `--identity <keyfile>` (default `~/.ssh/id_ed25519`), `--local-port`,
-`--workspace`. Using VSCodium/Insiders? `DEVC_CODE_BIN=codium devc-code.sh`.
+Multiple servers can be connected at once: each `--server` opens its own tunnel on
+an automatically chosen free port and gets its own VS Code profile. Options:
+`--identity <keyfile>` (default `~/.ssh/id_ed25519`), `--local-port` (force a port
+for a new tunnel), `--workspace`, `--no-clean`. Using VSCodium/Insiders?
+`DEVC_CODE_BIN=codium devc-code.sh`.
 
 ### From Windows (`devc-code.ps1`)
 
