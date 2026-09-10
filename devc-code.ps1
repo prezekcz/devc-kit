@@ -70,6 +70,13 @@ if (-not $Identity -and $cfg -and $cfg.Identity) { $Identity = $cfg.Identity }
 if (-not $Identity) { $Identity = "$env:USERPROFILE\.ssh\id_ed25519" }
 $sshArgs = @("-i", $Identity)
 
+# Plain `ssh` can resolve to the msys/git-bash build (first in PATH), which
+# tends to die silently when daemonized with -f on Windows: the process and
+# the local port live on, but the session is gone, so every podman call
+# through the tunnel hangs. Pin the native Windows OpenSSH build when present.
+$sshExe = Join-Path $env:SystemRoot "System32\OpenSSH\ssh.exe"
+if (-not (Test-Path $sshExe)) { $sshExe = "ssh" }
+
 # accept-new: auto-trust an unknown host key instead of the interactive yes/no
 # prompt (which broke the run under non-interactive parsing).
 $hkOpts = @("-o", "StrictHostKeyChecking=accept-new")
@@ -114,17 +121,22 @@ function Get-FreePort {
 # List one tunnel's devc-* containers, but never block forever on it. When a
 # tunnel's ssh session has silently died the local port keeps listening, so
 # `podman ... ps` connects and then hangs indefinitely (podman has no timeout) -
-# which would freeze the whole script on that one dead server. Run it in a child
-# job and give up after $TimeoutSec. Returns the name array, or $null if the
-# tunnel was unresponsive.
+# which would freeze the whole script on that one dead server. Instead of the
+# podman CLI, hit podman's REST API directly: Invoke-RestMethod has a real
+# timeout and skips both podman.exe startup and Start-Job overhead (~1 s each
+# in PS 5.1), which added many seconds to every run. Returns the name array,
+# or $null if the tunnel was unresponsive.
 function Get-DevcNames {
-    param([string]$Url, [int]$TimeoutSec = 10)
-    $job = Start-Job { param($u) & podman --url $u ps --filter "name=devc-" --format "{{.Names}}" 2>$null } -ArgumentList $Url
+    param([string]$Url, [int]$TimeoutSec = 5)
+    $base = $Url -replace '^tcp://', 'http://'
     try {
-        if (Wait-Job $job -Timeout $TimeoutSec) { return @(Receive-Job $job | Where-Object { $_ }) }
+        # filter names locally; NOTE: do not wrap the call in @() - PS 5.1
+        # returns the JSON array as ONE object, and @() would nest it so the
+        # pipeline sees a single item and only the first container survives.
+        $r = Invoke-RestMethod -Uri "$base/v4.0.0/libpod/containers/json" -TimeoutSec $TimeoutSec
+        return @($r | Where-Object { $_ } | ForEach-Object { $_.Names[0] } | Where-Object { $_ -like 'devc-*' })
+    } catch {
         return $null
-    } finally {
-        Remove-Job $job -Force
     }
 }
 
@@ -148,14 +160,22 @@ function Connect-Server {
 
     $existing = Get-Tunnels | Where-Object { $_.Server -eq $Srv } | Select-Object -First 1
     if ($existing) {
-        Write-Host "tunnel to $Srv already up on $($existing.Port)"
-        return $existing.Port
+        # A silently dead ssh session keeps its port listening, so probe before
+        # reusing - otherwise everything downstream hangs on a tunnel that
+        # forwards nowhere (and the dead-tunnel sweep in step 2 would only tear
+        # it down, skipping this server until the NEXT run).
+        if ($null -ne (Get-DevcNames -Url "tcp://127.0.0.1:$($existing.Port)")) {
+            Write-Host "tunnel to $Srv already up on $($existing.Port)"
+            return $existing.Port
+        }
+        Write-Warning "tunnel $($existing.Port) -> $Srv is unresponsive; rebuilding it"
+        Stop-Process -Id $existing.ProcId -Force -ErrorAction SilentlyContinue
     }
     # rootless podman socket path (depends only on the remote uid). Cached per
     # server, so only the FIRST ever connect to a server runs this discovery ssh.
     $socket = $script:Sockets[$Srv]
     if (-not $socket) {
-        $socket = (& ssh @sshArgs @hkOpts $Srv 'printf "/run/user/%s/podman/podman.sock" "$(id -u)"')
+        $socket = (& $sshExe @sshArgs @hkOpts $Srv 'printf "/run/user/%s/podman/podman.sock" "$(id -u)"')
         if (-not $socket) { throw "cannot ssh to $Srv ($Identity / password) - check 'ssh $Srv'." }
         $socket = "$socket".Trim()
         $script:Sockets[$Srv] = $socket
@@ -164,12 +184,30 @@ function Connect-Server {
 
     $port = if ($ForcePort -gt 0) { $ForcePort } else { Get-FreePort -Start $BasePort }
     Write-Host "opening tunnel $port -> ${Srv}:$socket"
-    # -f runs ssh in THIS console (so a password prompt is visible/typeable),
-    # authenticates, then forks to the background once the forward is up. A hidden
-    # window has no terminal, so a password server could never be answered there.
-    & ssh @sshArgs @hkOpts -f -N -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 -L "${port}:${socket}" $Srv
-    for ($i = 0; $i -lt 40; $i++) {
+
+    # Win32-OpenSSH does not implement -f: it authenticates but never forks to
+    # the background, so msys-style `-f -N` daemonization would block the
+    # script on the ssh line forever. Launch a plain -N tunnel via
+    # Start-Process instead: with key/agent auth as a hidden detached process
+    # (survives this console); when the server wants a password, in THIS
+    # console (-NoNewWindow) so the prompt is typed right here - the tunnel
+    # then lives only as long as this console does.
+    $tunArgs = $sshArgs + $hkOpts +
+        @('-N', '-o', 'ExitOnForwardFailure=yes', '-o', 'ServerAliveInterval=30', '-L', "${port}:${socket}", $Srv) |
+        ForEach-Object { if ("$_" -match '\s') { '"{0}"' -f $_ } else { "$_" } }
+
+    & $sshExe @sshArgs @hkOpts -o BatchMode=yes -o ConnectTimeout=10 $Srv exit 2>$null
+    if ($LASTEXITCODE -eq 0) {
+        $waitSec = 20
+        $proc = Start-Process -FilePath $sshExe -ArgumentList $tunArgs -WindowStyle Hidden -PassThru
+    } else {
+        $waitSec = 180
+        Write-Host "key auth not available for $Srv - enter the password below. The tunnel stays tied to THIS console (closing it drops the tunnel); install your key on the server to avoid both."
+        $proc = Start-Process -FilePath $sshExe -ArgumentList $tunArgs -NoNewWindow -PassThru
+    }
+    for ($i = 0; $i -lt $waitSec * 4; $i++) {
         Start-Sleep -Milliseconds 250
+        if ($proc.HasExited) { break }
         if (Get-NetTCPConnection -State Listen -LocalPort $port -ErrorAction SilentlyContinue) { break }
     }
     if (-not (Get-NetTCPConnection -State Listen -LocalPort $port -ErrorAction SilentlyContinue)) {
@@ -282,7 +320,13 @@ rm -f /tmp/vscode-ipc-*.sock "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"/vscode-ipc
 exit 0
 '@
     Write-Host "clearing any stale VS Code server in '$Container'"
-    & podman --url $url exec $Container /bin/sh -c $cleanup 2>$null
+    # Same job-with-timeout guard as Get-DevcNames: if the tunnel dies between
+    # the container listing and this exec, podman would hang here forever.
+    $job = Start-Job { param($u, $c, $s) & podman --url $u exec $c /bin/sh -c $s 2>$null } -ArgumentList $url, $Container, $cleanup
+    if (-not (Wait-Job $job -Timeout 30)) {
+        Write-Warning "cleanup in '$Container' timed out; attaching anyway"
+    }
+    Remove-Job $job -Force
 }
 
 # --- 5) isolated VS Code profile: seed once from your main profile + dockerPath -
@@ -306,10 +350,20 @@ if ($txt -notmatch 'dev\.containers\.dockerPath') {
     Set-Content $settings $txt -NoNewline
 }
 
-# --- 6) point podman at the tunnel for THIS process only, then launch VS Code --
-$env:CONTAINER_HOST = $url
-$env:DOCKER_HOST    = $url
+# --- 6) point podman at the tunnel for the VS Code child process only ---------
+# A .ps1 runs in the caller's process, so a plain $env: assignment would leak
+# into the interactive shell and silently redirect later local podman/devc
+# calls to this server. Set it just around the launch and restore afterwards.
 $hex = (([System.Text.Encoding]::ASCII.GetBytes($Container) | ForEach-Object { $_.ToString("x2") }) -join "")
 $uri = "vscode-remote://attached-container+$hex$Workspace"
 Write-Host "opening VS Code (profile: $ProfileDir): $uri"
-& code --user-data-dir $ProfileDir --extensions-dir $ExtDir --folder-uri $uri
+$prevContainerHost = $env:CONTAINER_HOST
+$prevDockerHost    = $env:DOCKER_HOST
+try {
+    $env:CONTAINER_HOST = $url
+    $env:DOCKER_HOST    = $url
+    & code --user-data-dir $ProfileDir --extensions-dir $ExtDir --folder-uri $uri
+} finally {
+    $env:CONTAINER_HOST = $prevContainerHost
+    $env:DOCKER_HOST    = $prevDockerHost
+}
