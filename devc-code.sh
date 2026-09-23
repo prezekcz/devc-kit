@@ -42,6 +42,82 @@ err()  { printf 'devc-code: %s\n' "$*" >&2; }
 die()  { err "$*"; exit 1; }
 usage() { sed -n '/^# Usage:/,/loginctl/p' "$0" | sed 's/^# \{0,1\}//'; }
 
+# --- shared VS Code server cache ---------------------------------------------
+# Every devc container mounts the named volume devc-vscode-server READ-ONLY at
+# /opt/devc-vscode-server. It holds pristine, unpacked VS Code Server builds
+# (bin/<commit>), so a new container doesn't pay for streaming ~200 MB of server
+# into itself: before VS Code attaches we copy the matching build into
+# ~/.vscode-server/bin locally, and VS Code finds it already installed.
+#
+# Only the host writes the volume: a throwaway container (no network, volume rw)
+# unpacks the tarball VS Code itself downloaded on this host
+# (/tmp/vsch-$USER/serverCache). Read-only in the dev containers, because what
+# lands there gets executed in every other container - one compromised by a
+# prompt injection must not be able to plant a server for all of them. For the
+# same reason extensions are not cached: a snapshot could only come from inside
+# a container. Builds older than 30 days (since fill) are pruned on the next
+# fill. Containers created without the volume simply skip the whole thing.
+VSCODE_VOL=devc-vscode-server
+VSCODE_MNT=/opt/devc-vscode-server
+
+# Runs as root in the throwaway filler container, volume at /cache, tarball on stdin.
+VSCODE_FILL='
+commit=$1; c=/cache/bin
+mkdir -p "$c" || exit 1
+find "$c" -mindepth 1 -maxdepth 1 -mtime +30 -exec rm -rf {} + 2>/dev/null
+# a build counts only if complete (product.json); drop leftovers of a bad copy
+[ -f "$c/$commit/product.json" ] && exit 0
+rm -rf "$c/$commit"
+t="$c/.$commit.$$"
+if mkdir -p "$t" && tar --no-same-owner -xz -C "$t"; then
+    # the tarball holds a single top-level dir (vscode-server-linux-<arch>/)
+    s=$(find "$t" -maxdepth 2 -name product.json | head -n1)
+    [ -n "$s" ] && mv -T "$(dirname "$s")" "$c/$commit" && touch "$c/$commit"
+fi
+rm -rf "$t"
+[ -f "$c/$commit/product.json" ]
+'
+
+# Runs as dev in the dev container: copy the cached build into ~/.vscode-server.
+VSCODE_COPY='
+commit=$1; c=$2/bin/$1; b=$HOME/.vscode-server/bin/$1
+# drop the symlink into the shared rw volume left by the first cache version
+e=$HOME/.vscode-server/extensionsCache
+[ -L "$e" ] && case "$(readlink "$e")" in /opt/vscode-cache*) rm -f "$e" ;; esac
+[ -f "$c/product.json" ] || exit 0
+[ -f "$b/product.json" ] && exit 0
+rm -rf "$b"; mkdir -p "${b%/*}" || exit 0
+cp -a "$c" "$b.$$" && mv -T "$b.$$" "$b"
+rm -rf "$b.$$"
+exit 0
+'
+
+# seed_vscode_server CODE_BIN CONTAINER PODMAN_CMD... - best effort, never fails.
+seed_vscode_server() {
+    local code_bin="$1" ctr="$2"; shift 2
+    local commit probe arch tar img
+    commit="$("$code_bin" --version 2>/dev/null | sed -n 2p)" || return 0
+    [ -n "$commit" ] || return 0
+    probe="$("$@" exec "$ctr" sh -c \
+        'uname -m; [ -d "$2" ] && echo vol; [ -f "$2/bin/$1/product.json" ] && echo cached; true' \
+        sh "$commit" "$VSCODE_MNT" 2>/dev/null)" || return 0
+    case "$probe" in *vol*) ;; *) return 0 ;; esac
+    case "$probe" in
+        *cached*) ;;
+        *)  case "$(printf '%s' "$probe" | head -n1)" in
+                x86_64) arch=x64 ;; aarch64|arm64) arch=arm64 ;; armv7l) arch=armhf ;; *) return 0 ;;
+            esac
+            tar="/tmp/vsch-$(id -un)/serverCache/$commit/vscode-server-linux-$arch.tar.gz"
+            [ -f "$tar" ] || return 0
+            # same image as the container: it's there already and has sh + tar
+            img="$("$@" inspect -f '{{.Image}}' "$ctr" 2>/dev/null)" || return 0
+            "$@" run --rm -i --network none --user 0 --entrypoint sh \
+                -v "$VSCODE_VOL:/cache" "$img" -c "$VSCODE_FILL" sh "$commit" \
+                <"$tar" >/dev/null 2>&1 || return 0 ;;
+    esac
+    "$@" exec "$ctr" sh -c "$VSCODE_COPY" sh "$commit" "$VSCODE_MNT" >/dev/null 2>&1 || true
+}
+
 # --- defaults ------------------------------------------------------------------
 CODE_BIN="${DEVC_CODE_BIN:-code}"          # VSCodium/insiders: DEVC_CODE_BIN=codium
 CONFIG_PATH="${DEVC_CODE_CONFIG:-$HOME/.devc-code.json}"
@@ -346,6 +422,12 @@ rm -f /tmp/vscode-ipc-*.sock "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"/vscode-ipc
 exit 0
 ' 2>/dev/null || true
 fi
+
+# --- 4b) pre-seed the VS Code server from the server's shared cache volume -----
+# (see devc: seed_vscode_server). Restores bin/ right after the cleanup above, so
+# neither a fresh container nor a re-attach has to stream the server in again.
+command -v "$CODE_BIN" >/dev/null 2>&1 && \
+    seed_vscode_server "$CODE_BIN" "$CONTAINER" podman --url "$URL"
 
 # --- 5) isolated VS Code profile: seed once from your main profile + dockerPath -
 prof_user="$PROFILE_DIR/User"
