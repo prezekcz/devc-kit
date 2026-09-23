@@ -20,6 +20,9 @@ project bind-mounted at `/workspace`.
 | `devc-code.ps1` | Attach Windows VS Code to a container on a **remote server**   |
 | `install.sh`    | Installer for Linux / macOS                                    |
 | `install.ps1`   | Installer for Windows                                          |
+| `devc-gui.ps1`  | Windows GUI to manage local + remote devc containers ([below](#gui-manage-containers-from-the-taskbar-devc-guips1)) |
+| `devc-gui.lib.ps1` | Data/action layer shared by the GUI and its worker threads |
+| `gen_gui_icon.py`  | Regenerates the GUI icon (`devc-gui.ico`)                  |
 
 ## Prerequisites (all platforms)
 
@@ -210,3 +213,45 @@ If present on the host, these are mounted so auth/config "just works":
   server, or migrate to overlay with a `podman system reset` (wipes containers).
 - **VS Code under snap/flatpak (Linux)** — these rewrite `$HOME`; the bash script
   already resolves the real home via `getent`, so `~/.claude` mounts correctly.
+
+## GUI: manage containers from the taskbar (`devc-gui.ps1`)
+
+A **Windows-only** WinForms front end for everything above: it shows every
+`devc-*` container — **local and on connected remote servers** — in one table and
+lets you start / stop / restart / open a shell / attach VS Code / view logs /
+remove, without typing commands.
+
+```powershell
+# run it (visible console, handy while trying it out)
+powershell -ExecutionPolicy Bypass -File .\devc-gui.ps1
+```
+
+Then **Tools → Pin to taskbar** creates a shortcut that launches it hidden (no
+console flash) with its own icon; right-click the taskbar entry to pin it.
+
+What it does:
+
+- **Remote servers** are read over the same OpenSSH tunnels `devc-code.ps1` opens
+  (it discovers them from the running `ssh.exe` processes — no state file), via
+  podman's REST API with a real timeout, so a dead tunnel is shown as
+  `unresponsive` and torn down instead of hanging the window.
+- **Local** containers are read with the `podman` CLI.
+- **VS Code attach** (button or double-click a row) is delegated to
+  `devc-code.ps1` (remote) / `devc.ps1 code` (local) unchanged — all the tuned
+  workarounds still apply. It opens in a visible console so a password prompt has
+  somewhere to go.
+- **Connect server…** opens a tunnel to a key-auth server silently; for a
+  password-only server it asks for the password in a dialog and feeds it to ssh
+  via `SSH_ASKPASS` (no console needed). If your OpenSSH build ignores askpass or
+  the password is wrong, it falls back to a visible console you can type into.
+- A **filter box** (top right) narrows the table live as you type (matches any
+  column). **Right-click a row** to *Open containing folder* (Explorer), *Copy
+  path*, or *Copy container name*; local `/mnt/c/...` mount paths are translated
+  back to `C:\...`, and the open action is disabled for remote (server) rows.
+- Reads run on background threads, so the window stays responsive; there is **no
+  auto-refresh** — hit **Refresh** (it also refreshes after each action).
+
+Requires Windows PowerShell 5.1 (the default `powershell.exe`), the `podman`
+client, and — for VS Code attach — VS Code with the Dev Containers extension.
+Needs no administrator rights. Regenerate the icon with
+`python gen_gui_icon.py` (needs Pillow).
