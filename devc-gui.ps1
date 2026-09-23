@@ -43,14 +43,49 @@ public class DevcColumnSorter : IComparer {
 '@
 }
 
+# ===========================================================================
+# Log (%LOCALAPPDATA%\devc\devc-gui.log), to find out afterwards what was done
+# and what went wrong: every click with the row it acted on, every status line,
+# each background job with its duration and failure, launched processes, and
+# unexpected exceptions. Written from the UI thread only (workers report through
+# their results), so no locking. Never log passwords. Rolls over to .1 at 1 MB.
+# ===========================================================================
+$logDir = $env:LOCALAPPDATA
+if (-not $logDir) { $logDir = $env:TEMP }
+$script:LogPath = Join-Path $logDir 'devc\devc-gui.log'
+try {
+    [void](New-Item -ItemType Directory -Force -Path (Split-Path $script:LogPath))
+    if ((Test-Path $script:LogPath) -and (Get-Item $script:LogPath).Length -gt 1MB) {
+        Move-Item -Force $script:LogPath "$script:LogPath.1"
+    }
+} catch { }
+
+function Write-DevcLog {
+    param([string]$Tag, [string]$Text)
+    $line = '{0} {1,5} [{2}] {3}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff'), $PID, $Tag, $Text
+    try { [System.IO.File]::AppendAllText($script:LogPath, $line + [Environment]::NewLine) } catch { }
+}
+
+$rev = ''
+if (Get-Command git -ErrorAction SilentlyContinue) {
+    try { $rev = (& git -C $PSScriptRoot rev-parse --short HEAD 2>$null) } catch { }
+}
+Write-DevcLog 'start' ("{0} {1}, PS {2}, {3}, host {4}" -f $PSCommandPath, $rev,
+    $PSVersionTable.PSVersion, [Environment]::OSVersion.VersionString, $Host.Name)
+
 # Unhandled UI-thread exceptions. When the host pipeline is stopped while the
 # window is up (VS Code Stop / Ctrl+C), ShowDialog keeps pumping and the next
 # scriptblock handler (Pump tick) throws PipelineStoppedException into WinForms,
 # which would show its crash dialog. Rethrow that one so ShowDialog unwinds into
 # the finally below; anything else gets a plain message box and the GUI lives on.
 # C#, because a scriptblock handler can't run once the pipeline is stopped.
-if (-not ('DevcUiGuard' -as [type])) {
-    Add-Type -ReferencedAssemblies System.Windows.Forms -TypeDefinition @'
+#
+# A type can't be redefined in a running session (VS Code's PowerShell console
+# keeps it between runs), so the class name carries a hash of its source: after
+# an edit the new version loads under a fresh name instead of the stale one.
+$guardSrc = @'
+using System;
+using System.IO;
 using System.Management.Automation;
 using System.Runtime.ExceptionServices;
 using System.Threading;
@@ -58,21 +93,38 @@ using System.Windows.Forms;
 
 public static class DevcUiGuard {
     private static bool installed;
-    public static void Install() {
+    public static string LogPath;
+    public static void Install(string logPath) {
+        LogPath = logPath;
         if (installed) return;
         installed = true;
         Application.ThreadException += OnThreadException;
     }
+    private static void Log(string text) {
+        try {
+            File.AppendAllText(LogPath, String.Format("{0:yyyy-MM-dd HH:mm:ss.fff} {1,5} [crash] {2}{3}",
+                DateTime.Now, System.Diagnostics.Process.GetCurrentProcess().Id, text, Environment.NewLine));
+        } catch { }
+    }
     private static void OnThreadException(object sender, ThreadExceptionEventArgs e) {
-        if (e.Exception is PipelineStoppedException)
+        if (e.Exception is PipelineStoppedException) {
+            Log("pipeline stopped while the window was up - shutting down");
             ExceptionDispatchInfo.Capture(e.Exception).Throw();
+        }
+        Log(e.Exception.ToString());
         MessageBox.Show(e.Exception.Message, "devc - unexpected error",
             MessageBoxButtons.OK, MessageBoxIcon.Error);
     }
 }
 '@
+$guardHash = -join ([System.Security.Cryptography.SHA1]::Create().ComputeHash(
+    [System.Text.Encoding]::UTF8.GetBytes($guardSrc))[0..3] | ForEach-Object { $_.ToString('x2') })
+$guardName = "DevcUiGuard_$guardHash"
+if (-not ($guardName -as [type])) {
+    Add-Type -ReferencedAssemblies System.Windows.Forms `
+        -TypeDefinition ($guardSrc -replace 'class DevcUiGuard\b', "class $guardName")
 }
-[DevcUiGuard]::Install()
+($guardName -as [type])::Install($script:LogPath)
 
 # Data / action layer, shared with the worker runspaces (§7). Dot-source it here
 # for the UI-thread calls; each worker dot-sources it again for its own scope.
@@ -91,13 +143,17 @@ $script:Pending = New-Object System.Collections.ArrayList
 $script:BusyCount = 0
 
 function Start-Async {
-    param([scriptblock]$Work, [object[]]$Arguments, [scriptblock]$OnDone)
+    param([scriptblock]$Work, [object[]]$Arguments, [scriptblock]$OnDone, [string]$Label)
+    # label for the log; defaults to the calling function (Invoke-Lifecycle, ...)
+    if (-not $Label) { $Label = (Get-PSCallStack)[1].Command }
+    Write-DevcLog 'job' "start $Label"
     $ps = [powershell]::Create()
     $ps.RunspacePool = $script:Pool
     [void]$ps.AddScript($Work)
     foreach ($a in $Arguments) { [void]$ps.AddArgument($a) }
     [void]$script:Pending.Add([pscustomobject]@{
         PS = $ps; Handle = $ps.BeginInvoke(); OnDone = $OnDone
+        Label = $Label; Watch = [System.Diagnostics.Stopwatch]::StartNew()
     })
 }
 
@@ -117,8 +173,10 @@ $menu = New-Object System.Windows.Forms.MenuStrip
 $mnuTools = New-Object System.Windows.Forms.ToolStripMenuItem('Tools')
 $mnuPin   = New-Object System.Windows.Forms.ToolStripMenuItem('Pin to taskbar')
 $mnuBuild = New-Object System.Windows.Forms.ToolStripMenuItem('Build base image...')
+$mnuLog   = New-Object System.Windows.Forms.ToolStripMenuItem('Open log')
 [void]$mnuTools.DropDownItems.Add($mnuPin)
 [void]$mnuTools.DropDownItems.Add($mnuBuild)
+[void]$mnuTools.DropDownItems.Add($mnuLog)
 [void]$menu.Items.Add($mnuTools)
 $form.MainMenuStrip = $menu
 
@@ -216,7 +274,20 @@ $form.Controls.AddRange(@(
 # ===========================================================================
 # Status + row helpers (all UI thread)
 # ===========================================================================
-function Set-Status { param([string]$Text) $statusLabel.Text = $Text }
+function Set-Status {
+    param([string]$Text, [switch]$NoLog)
+    $statusLabel.Text = $Text
+    if (-not $NoLog) { Write-DevcLog 'status' $Text }
+}
+
+# log a user action together with the row it acts on
+function Write-DevcAction {
+    param([string]$Action)
+    $row = Get-SelectedRow
+    $on = ''
+    if ($row) { $on = " $($row.Name) @ $($row.Location) [$($row.State)]" }
+    Write-DevcLog 'click' "$Action$on"
+}
 
 function Get-SelectedRow {
     if ($listView.SelectedItems.Count -eq 0) { return $null }
@@ -272,7 +343,7 @@ function Update-RowFilter {
     Update-ButtonState
     $shown = $listView.Items.Count
     $total = $script:AllRows.Count
-    if ("$($txtSearch.Text)".Trim()) { Set-Status "filter: $shown / $total shown" }
+    if ("$($txtSearch.Text)".Trim()) { Set-Status "filter: $shown / $total shown" -NoLog }
 }
 
 # enable only the buttons that make sense for the selected row's state (§4)
@@ -348,7 +419,8 @@ function Invoke-Refresh {
             . $libPath
             Get-DevcServerSnapshot -Server $server -Port $port -TimeoutSec 5
         }
-        Start-Async -Work $work -Arguments @($script:LibPath, $t.Server, $t.Port) -OnDone $onServerDone
+        Start-Async -Work $work -Arguments @($script:LibPath, $t.Server, $t.Port) -OnDone $onServerDone `
+            -Label "refresh $($t.Server):$($t.Port)"
     }
 
     # local
@@ -357,7 +429,7 @@ function Invoke-Refresh {
         . $libPath
         Get-DevcContainersLocal
     }
-    Start-Async -Work $localWork -Arguments @($script:LibPath) -OnDone {
+    Start-Async -Work $localWork -Arguments @($script:LibPath) -Label 'refresh local' -OnDone {
         param($res)
         if ($res -and $res.Ok) {
             foreach ($r in @($res.Rows)) { Add-ContainerRow $r; $script:RefreshCount++ }
@@ -373,8 +445,10 @@ function Complete-RefreshStep {
     if ($script:RefreshDone -ge $script:RefreshTotal) {
         Set-Busy $false
         Update-ButtonState
-        $tunnels = @(Get-DevcTunnels)
-        $msg = "{0} container(s) on {1} server(s)" -f $script:RefreshCount, $tunnels.Count
+        # server count from the refresh itself: re-running Get-DevcTunnels here
+        # (a CIM process query) froze the window for ~0.75 s
+        $servers = $script:RefreshTotal - 1 - $script:RefreshDead.Count
+        $msg = "{0} container(s) on {1} server(s)" -f $script:RefreshCount, $servers
         if ($script:RefreshDead.Count -gt 0) {
             $msg += " - unresponsive (torn down): $($script:RefreshDead -join ', ')"
         }
@@ -414,7 +488,11 @@ function Start-DevcProcessCompat {
         $psi.EnvironmentVariables['CONTAINER_HOST'] = $ContainerHost
         $psi.EnvironmentVariables['DOCKER_HOST']    = $ContainerHost
     }
-    [System.Diagnostics.Process]::Start($psi)
+    $p = [System.Diagnostics.Process]::Start($psi)
+    $envNote = ''
+    if ($ContainerHost) { $envNote = " (CONTAINER_HOST=$ContainerHost)" }
+    Write-DevcLog 'exec' ("pid {0}: {1} {2}{3}" -f $p.Id, $FilePath, ($Arguments -join ' '), $envNote)
+    $p
 }
 
 # ===========================================================================
@@ -818,20 +896,24 @@ function Pin-ToTaskbar {
 # ===========================================================================
 # Wire up events
 # ===========================================================================
-$btnRefresh.Add_Click({ Invoke-Refresh })
-$btnConnect.Add_Click({ Invoke-Connect })
-$btnDisconnect.Add_Click({ Invoke-Disconnect })
-$btnStart.Add_Click({ Invoke-Lifecycle 'start' })
-$btnStop.Add_Click({ Invoke-Lifecycle 'stop' })
-$btnRestart.Add_Click({ Invoke-Lifecycle 'restart' })
-$btnShell.Add_Click({ Invoke-Shell })
-$btnLogs.Add_Click({ Show-Logs })
-$btnCode.Add_Click({ Invoke-VsCode })
-$btnRemove.Add_Click({ Invoke-Remove })
-$mnuPin.Add_Click({ Pin-ToTaskbar })
-$mnuBuild.Add_Click({ Invoke-Build })
+$btnRefresh.Add_Click({ Write-DevcAction 'refresh'; Invoke-Refresh })
+$btnConnect.Add_Click({ Write-DevcAction 'connect'; Invoke-Connect })
+$btnDisconnect.Add_Click({ Write-DevcAction 'disconnect'; Invoke-Disconnect })
+$btnStart.Add_Click({ Write-DevcAction 'start'; Invoke-Lifecycle 'start' })
+$btnStop.Add_Click({ Write-DevcAction 'stop'; Invoke-Lifecycle 'stop' })
+$btnRestart.Add_Click({ Write-DevcAction 'restart'; Invoke-Lifecycle 'restart' })
+$btnShell.Add_Click({ Write-DevcAction 'shell'; Invoke-Shell })
+$btnLogs.Add_Click({ Write-DevcAction 'logs'; Show-Logs })
+$btnCode.Add_Click({ Write-DevcAction 'vscode'; Invoke-VsCode })
+$btnRemove.Add_Click({ Write-DevcAction 'remove'; Invoke-Remove })
+$mnuPin.Add_Click({ Write-DevcAction 'pin to taskbar'; Pin-ToTaskbar })
+$mnuBuild.Add_Click({ Write-DevcAction 'build image'; Invoke-Build })
+$mnuLog.Add_Click({
+    if (Test-Path $script:LogPath) { Start-Process notepad.exe $script:LogPath }
+    else { Set-Status "no log yet: $script:LogPath" -NoLog }
+})
 $listView.Add_SelectedIndexChanged({ Update-ButtonState })
-$listView.Add_DoubleClick({ Invoke-VsCode })   # §4: double-click = VS Code attach
+$listView.Add_DoubleClick({ Write-DevcAction 'vscode (double-click)'; Invoke-VsCode })   # §4: double-click = VS Code attach
 
 # filter box: re-render the visible rows as the user types
 $txtSearch.Add_TextChanged({ Update-RowFilter })
@@ -854,9 +936,9 @@ $rowMenu.Add_Opening({
     $miOpenFolder.Enabled = [bool]$win
     $miCopyPath.Enabled   = [bool]$row.Path
 })
-$miOpenFolder.Add_Click({ Open-DevcFolder })
-$miCopyPath.Add_Click({ Copy-DevcPath })
-$miCopyName.Add_Click({ Copy-DevcName })
+$miOpenFolder.Add_Click({ Write-DevcAction 'open folder'; Open-DevcFolder })
+$miCopyPath.Add_Click({ Write-DevcAction 'copy path'; Copy-DevcPath })
+$miCopyName.Add_Click({ Write-DevcAction 'copy name'; Copy-DevcName })
 
 # column-click sort
 $script:SortCol = -1
@@ -902,8 +984,18 @@ $script:Pump.Add_Tick({
                 $res = $j.PS.EndInvoke($j.Handle)
                 $payload = $null
                 if ($res -and $res.Count -gt 0) { $payload = $res[$res.Count - 1] }
+                # non-terminating errors inside the worker never reach the UI
+                foreach ($e in @($j.PS.Streams.Error)) {
+                    Write-DevcLog 'job' "$($j.Label): worker error: $e"
+                }
+                $outcome = ''
+                if ($payload -and $payload.PSObject.Properties['Ok'] -and -not $payload.Ok) {
+                    $outcome = " - FAILED: $($payload.Error)"
+                }
+                Write-DevcLog 'job' ("done {0} in {1} ms{2}" -f $j.Label, $j.Watch.ElapsedMilliseconds, $outcome)
                 if ($j.OnDone) { & $j.OnDone $payload }
             } catch {
+                Write-DevcLog 'error' "$($j.Label): $($_.Exception.Message)`n$($_.ScriptStackTrace)"
                 Set-Status "error: $($_.Exception.Message)"
             } finally {
                 $j.PS.Dispose()
@@ -929,4 +1021,5 @@ try {
     $script:Pending.Clear()
     try { $script:Pool.Close(); $script:Pool.Dispose() } catch { }
     $form.Dispose()
+    Write-DevcLog 'exit' ''
 }
